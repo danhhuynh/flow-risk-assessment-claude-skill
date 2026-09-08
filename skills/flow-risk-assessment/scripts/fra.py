@@ -357,18 +357,34 @@ def doctor(cfg) -> int:
     tracked = set(git("ls-files").splitlines())
     errors = warnings = 0
 
+    # Phát hiện id trùng hoặc chưa điền — hay xảy ra khi copy template nhiều lần
+    seen: dict[str, list[str]] = {}
     for flow in flows:
         fid = flow.get("id", Path(flow["_path"]).stem)
+        seen.setdefault(fid, []).append(flow["_path"])
+    for fid, paths in seen.items():
+        if len(paths) > 1:
+            print(f"  ✗ id trùng '{fid}' ở {len(paths)} file: {', '.join(paths)}")
+            errors += 1
+        if "TODO" in str(fid):
+            print(f"  ✗ {paths[0]}: id còn là placeholder ('{fid}') — chưa điền template")
+            errors += 1
+
+    for flow in flows:
+        fid = flow.get("id", Path(flow["_path"]).stem)
+        # Nếu id chưa điền hoặc trùng, hiển thị đường dẫn để phân biệt được file
+        label = fid if (len(seen.get(fid, [])) == 1 and "TODO" not in str(fid)) \
+                else flow["_path"]
 
         for required in ("id", "name", "severity", "steps"):
             if required not in flow:
-                print(f"  ✗ {fid}: thiếu field bắt buộc '{required}'")
+                print(f"  ✗ {label}: thiếu field bắt buộc '{required}'")
                 errors += 1
 
         sev = flow.get("severity", {}) or {}
         for flag in ("idempotent", "reversible", "compensating_action"):
             if flag not in sev:
-                print(f"  ⚠ {fid}: thiếu severity.{flag} "
+                print(f"  ⚠ {label}: thiếu severity.{flag} "
                       f"(cờ khuếch đại, ảnh hưởng xếp hạng)")
                 warnings += 1
 
@@ -376,19 +392,19 @@ def doctor(cfg) -> int:
         for step in flow.get("steps", []):
             for ent in step.get("entities", []):
                 if not any(entity_matches(ent, f) for f in tracked):
-                    print(f"  ✗ {fid}/{step.get('id')}: entity không resolve: {ent}")
+                    print(f"  ✗ {label}/{step.get('id')}: entity không resolve: {ent}")
                     errors += 1
 
         op = flow.get("operational", {}) or {}
         if op.get("executions_per_day") is None:
-            print(f"  ⚠ {fid}: thiếu operational.executions_per_day "
+            print(f"  ⚠ {label}: thiếu operational.executions_per_day "
                   f"(không tính được canary blindness)")
             warnings += 1
 
         if sev.get("class") == "critical":
             obs = op.get("observability", {}) or {}
             if not obs.get("alertable_metric"):
-                print(f"  ⚠ {fid}: flow critical không có alertable_metric")
+                print(f"  ⚠ {label}: flow critical không có alertable_metric")
                 warnings += 1
 
         n_conf = sum(
@@ -397,7 +413,7 @@ def doctor(cfg) -> int:
             if iv.get("status") == "confirmed"
         )
         if n_conf == 0:
-            print(f"  ⚠ {fid}: chưa có invariant nào status=confirmed")
+            print(f"  ⚠ {label}: chưa có invariant nào status=confirmed")
             warnings += 1
 
     print(f"\n{len(flows)} flow · {errors} lỗi · {warnings} cảnh báo")
