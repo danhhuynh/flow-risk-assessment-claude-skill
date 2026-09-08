@@ -471,6 +471,115 @@ def build_traffic(log_path: str, fmt: str, days: int) -> dict:
     }
 
 
+# ──────────────────── CloudWatch Logs Insights ────────────────────
+
+INSIGHTS_QUERY = r"""
+fields @message
+| parse @message /(?<m>[A-Z]{3,7}) (?<p>\/[^\s?"]*)/
+| filter ispresent(p)
+| stats count(*) as cnt by m, p
+| sort cnt desc
+| limit 300
+"""
+
+
+def aws(*args) -> str:
+    """Chạy aws CLI. Thoát với hướng dẫn SSO nếu chưa đăng nhập."""
+    try:
+        r = subprocess.run(["aws", *args], capture_output=True, text=True)
+    except FileNotFoundError:
+        sys.exit(
+            "Chưa cài AWS CLI.\n\n"
+            "  macOS:  brew install awscli\n"
+            "  Linux:  https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html\n\n"
+            "Cài xong thì: aws sso login --profile <profile>"
+        )
+    if r.returncode != 0:
+        err = r.stderr.strip()
+        if any(k in err for k in ("ExpiredToken", "SSO", "credentials",
+                                  "Unable to locate", "InvalidClientTokenId",
+                                  "AccessDenied", "sso session")):
+            sys.exit(
+                "Chưa đăng nhập AWS (hoặc token đã hết hạn).\n\n"
+                "  aws sso login --profile <profile>\n"
+                "  export AWS_PROFILE=<profile>\n\n"
+                "Rồi chạy lại lệnh này.\n"
+                f"\nChi tiết: {err[:300]}"
+            )
+        sys.exit(f"aws {' '.join(args)} thất bại:\n{err[:500]}")
+    return r.stdout
+
+
+def cloudwatch_check() -> None:
+    ident = json.loads(aws("sts", "get-caller-identity", "--output", "json"))
+    print(f"✓ Đã đăng nhập: {ident.get('Arn', '?')}")
+    print(f"  Account: {ident.get('Account', '?')}\n")
+
+    groups = json.loads(aws("logs", "describe-log-groups",
+                            "--output", "json"))["logGroups"]
+    if not groups:
+        print("Không thấy log group nào. Kiểm tra --region.")
+        return
+    print(f"{len(groups)} log group:")
+    for g in sorted(groups, key=lambda x: -x.get("storedBytes", 0))[:25]:
+        mb = g.get("storedBytes", 0) / 1e6
+        print(f"  {mb:>10,.0f} MB  {g['logGroupName']}")
+    print("\n→ Chọn 1 group rồi chạy:")
+    print("  fra.py cloudwatch --group <tên> --days 30")
+
+
+def cloudwatch_traffic(group: str, days: int) -> dict:
+    import time
+    end = int(time.time())
+    start = end - days * 86400
+
+    qid = json.loads(aws(
+        "logs", "start-query",
+        "--log-group-name", group,
+        "--start-time", str(start),
+        "--end-time", str(end),
+        "--query-string", INSIGHTS_QUERY,
+        "--output", "json",
+    ))["queryId"]
+
+    print(f"Query {qid} đang chạy", end="", flush=True)
+    for _ in range(120):                      # tối đa ~4 phút
+        time.sleep(2)
+        res = json.loads(aws("logs", "get-query-results",
+                             "--query-id", qid, "--output", "json"))
+        if res["status"] in ("Complete", "Failed", "Cancelled", "Timeout"):
+            break
+        print(".", end="", flush=True)
+    else:
+        sys.exit("\nQuery quá lâu. Thử --days nhỏ hơn.")
+    print()
+
+    if res["status"] != "Complete":
+        sys.exit(f"Query {res['status']}. Thử --days nhỏ hơn hoặc kiểm log format.")
+
+    counts = Counter()
+    for row in res["results"]:
+        f = {c["field"]: c["value"] for c in row}
+        if "m" in f and "p" in f:
+            counts[f"{f['m']} {normalize_path(f['p'])}"] += int(f.get("cnt", 0))
+
+    scanned = res.get("statistics", {}).get("recordsScanned", 0)
+    matched = res.get("statistics", {}).get("recordsMatched", 0)
+    if scanned and matched / scanned < 0.5:
+        print(f"⚠ Chỉ khớp {matched:,.0f}/{scanned:,.0f} record "
+              f"({matched/scanned:.0%}). Log format có thể không phải HTTP "
+              f"access log — kiểm lại group.", file=sys.stderr)
+
+    return {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "source": f"cloudwatch:{group}",
+        "window_days": days,
+        "records_scanned": scanned,
+        "records_matched": matched,
+        "endpoints": {ep: round(n / days, 2) for ep, n in counts.most_common(300)},
+    }
+
+
 # ──────────────────────────── init ────────────────────────────────
 
 EXAMPLE_FLOW = """\
@@ -631,6 +740,13 @@ def main():
     b = sub.add_parser("backtest")
     b.add_argument("--last", type=int, default=20)
 
+    sub.add_parser("aws-check")
+
+    cw = sub.add_parser("cloudwatch")
+    cw.add_argument("--group", required=True, help="tên CloudWatch log group")
+    cw.add_argument("--days", type=int, default=30)
+    cw.add_argument("--top", type=int, default=40)
+
     args = ap.parse_args()
 
     cfg = DEFAULT_CONFIG
@@ -664,6 +780,20 @@ def main():
         if args.json:
             Path(args.json).write_text(json.dumps(rep, indent=2,
                                                   ensure_ascii=False))
+
+    elif args.cmd == "aws-check":
+        cloudwatch_check()
+
+    elif args.cmd == "cloudwatch":
+        data = cloudwatch_traffic(args.group, args.days)
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        out = CACHE_DIR / "traffic.json"
+        out.write_text(json.dumps(data, indent=2))
+        print(f"✓ {out}  ({data['records_matched']:,.0f} record khớp)\n")
+        print(f"{'lần/ngày':>12}  endpoint")
+        for ep, rate in list(data["endpoints"].items())[:args.top]:
+            print(f"{rate:>12,.1f}  {ep}")
+        print("\n→ Dùng các số này cho operational.executions_per_day trong manifest.")
 
     elif args.cmd == "backtest":
         backtest(args.last, cfg)
