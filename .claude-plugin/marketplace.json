@@ -1,0 +1,1 @@
+{"name":"fra","owner":{"name":"danhhuynh"},"metadata":{"description":"Flow Risk Assessment","version":"1.0.0"},"plugins":[{"name":"flow-risk-assessment","source":".","description":"Danh gia rui ro PR dua tren Business Flow Manifest va mo hinh PIE","version":"1.0.0","skills":["./skills/flow-risk-assessment"]}]}
