@@ -1,0 +1,60 @@
+# .github/workflows/fra.yml
+# Chế độ comment-only. KHÔNG gate cho tới khi backtest (T1.7) đã đạt.
+name: FRA
+
+on: pull_request
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  assess:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0        # BẮT BUỘC — thiếu thì co-change/SZZ trả rỗng
+                                # mà không báo lỗi. Lỗi im lặng tệ nhất.
+
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+
+      - run: pip install pyyaml
+
+      - name: Validate manifest (drift detection)
+        run: python3 tools/fra.py doctor
+
+      - uses: actions/cache@v4
+        with:
+          path: .fra/cache
+          key: fra-cochange-${{ github.base_ref }}-${{ github.run_number }}
+          restore-keys: fra-cochange-${{ github.base_ref }}-
+
+      - name: Analyze
+        run: |
+          python3 tools/fra.py analyze \
+            --base "${{ github.event.pull_request.base.sha }}" \
+            --head "${{ github.event.pull_request.head.sha }}" \
+            --json fra-report.json | tee fra-comment.txt
+
+      - uses: actions/upload-artifact@v4
+        with: { name: fra-report, path: fra-report.json }
+
+      - name: Comment on PR
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const body = '```\n' + fs.readFileSync('fra-comment.txt','utf8') + '\n```';
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body,
+            });
+
+      # Bật khối này CHỈ sau khi Phase 3 xong. Gate dựa trên phát hiện cấu
+      # trúc (armed cut set / security / drift), KHÔNG dựa trên risk band.
+      # - name: Gate
+      #   run: python3 tools/fra.py gate --report fra-report.json --on structural_only

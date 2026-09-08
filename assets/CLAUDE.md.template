@@ -1,0 +1,314 @@
+# CLAUDE.md — Flow Risk Assessment (FRA)
+
+Tài liệu này là chỉ dẫn làm việc cho AI agent trong repo này. Đọc hết trước khi
+viết bất kỳ dòng code nào cho FRA.
+
+---
+
+## 1. Bối cảnh dự án
+
+FRA dự đoán rủi ro sự cố production từ PR diff, dựa trên **Business Flow
+Manifest** — một mô tả tường minh các luồng nghiệp vụ, invariant, và tần suất
+vận hành của chúng.
+
+Với mỗi PR, FRA trả lời ba câu hỏi:
+
+1. Thay đổi này chạm vào business flow nào?
+2. Rủi ro gây sự cố cao hay thấp, và **thừa số nào chi phối**?
+3. Nên deploy nó bằng chiến lược gì?
+
+**Nền tảng lý thuyết:** mô hình PIE (Voas 1992) / RIPR — một fault chỉ thành
+failure khi đi trọn chuỗi Reachability → Infection → Propagation →
+Revealability. Đây là lý do FRA không phải là một defect predictor chấm điểm
+file: nó phân rã xác suất theo chuỗi nhân quả, và mỗi thừa số có nguồn dữ liệu
+riêng.
+
+Spec lý thuyết đầy đủ: `docs/fra/SPEC.md`
+Kế hoạch triển khai theo task: `docs/fra/IMPLEMENTATION.md`
+Hướng dẫn viết manifest: `docs/fra/MANIFEST-GUIDE.md`
+
+---
+
+## 2. Trạng thái hiện tại
+
+```
+Phase 1 (impact mapping)        ▓▓▓▓▓▓▓▓▓▓  hoàn thành — fra.py chạy được
+Phase 2 (detection + invariant) ░░░░░░░░░░  chưa bắt đầu
+Phase 3 (fault tree + cut set)  ░░░░░░░░░░  chưa bắt đầu
+Phase 4 (calibration)           ░░░░░░░░░░  chưa bắt đầu
+
+Chế độ output hiện tại: structural_only
+Số nhãn đã có: 0
+Số flow trong manifest: 0
+```
+
+**Cập nhật khối này mỗi khi hoàn thành một task.** Nó là nguồn sự thật duy nhất
+về việc dự án đang ở đâu.
+
+---
+
+## 3. Luật cứng — KHÔNG BAO GIỜ vi phạm
+
+Mười hai luật dưới đây là các sai lầm đã được xác định trước. Chúng trông vô
+hại lúc code nhưng phá hủy giá trị của hệ thống. Nếu một task có vẻ yêu cầu vi
+phạm một luật, **dừng lại và hỏi người**, đừng tự quyết.
+
+### 3.1 LLM không bao giờ sinh ra số
+
+```
+❌ prompt: "Xác suất PR này gây lỗi là bao nhiêu %?"
+❌ prompt: "Cho điểm rủi ro từ 1 đến 10"
+✅ prompt: "Invariant inv_atomicity có bị vi phạm không? verdict + evidence file:line"
+```
+
+Output LLM không có hiệu chỉnh (calibration). Hỏi số thì luôn nhận về một con
+số nghe hợp lý mà không có nền tảng nào. **Mọi con số phải đến từ**: access log,
+git history, coverage report, hoặc phép tính tường minh trong code.
+
+Bắt buộc: `llm/guards.py` phải reject response chứa số phần trăm hoặc điểm số.
+
+### 3.2 Chỉ invariant `status: confirmed` được tính điểm
+
+Invariant `llm_proposed` chưa ai xác nhận thì chỉ xuất hiện dưới dạng advisory
+trong PR comment. Không bao giờ tự động chuyển `proposed` → `confirmed`.
+
+Không có hàng rào này, hệ thống sẽ dần tự sinh tiêu chuẩn rồi tự đánh giá theo
+tiêu chuẩn của chính nó.
+
+### 3.3 `None` ≠ `0` ở operational profile
+
+```python
+❌ epd = profile.get(endpoint, 0)
+✅ epd = profile.get(endpoint)          # None nếu không biết
+   p_r = 0.5 if epd is None else ...    # unknown → bảo thủ
+```
+
+`0` nghĩa là "đo được và không có traffic" → rủi ro thật sự thấp.
+`None` nghĩa là "không đo được" → phải rơi về giá trị bảo thủ.
+
+Nhầm hai thứ này khiến mọi flow chưa instrument tự động được đánh giá an toàn —
+chính xác ngược lại thực tế.
+
+### 3.4 Diff coverage, không phải total coverage
+
+Chỉ tính coverage trên **các dòng đã thay đổi**. Repo coverage 80% vẫn có thể
+có diff coverage 0% trên đúng PR nguy hiểm.
+
+### 3.5 Impact closure phải có `max_depth ≤ 3`
+
+Ở depth 4+, closure phình ra chạm gần hết repo và mọi PR sẽ "chạm mọi flow".
+Output trở nên vô nghĩa. Ràng buộc này là bắt buộc, không phải tinh chỉnh.
+
+### 3.6 Gate chỉ dựa trên phát hiện cấu trúc
+
+```
+✅ Gate được: armed cut set, security finding, manifest drift
+              → đều là boolean, đúng bất kể đã hiệu chỉnh hay chưa
+❌ Không gate: risk_band, probability value
+              → chỉ để xếp hạng và định tuyến deploy strategy
+```
+
+### 3.7 Không xuất số khi chưa hiệu chỉnh
+
+| Nhãn có sẵn | Được xuất gì |
+|---|---|
+| 0 | Chỉ phát hiện cấu trúc. **Không số, không dải** |
+| 1–49 | Dải thứ tự, ghi rõ "chưa hiệu chỉnh" |
+| 50–199 | Dải + base rate lịch sử |
+| 200+ | Xác suất kèm khoảng tin cậy 90% |
+
+Xuất số khi chưa hiệu chỉnh **tệ hơn không xuất gì**, vì con số tạo ra sự tự
+tin không có cơ sở.
+
+### 3.8 Luôn tính common cause (`β`)
+
+```python
+❌ p_flow = 1 - prod(1 - p_i for p_i in ps)
+✅ p_ind = 1 - prod(1 - (1-beta)*p_i for p_i in ps)
+   p_cc  = beta * max(ps)
+   p_flow = p_ind + p_cc - p_ind*p_cc
+```
+
+Change unit trong cùng PR **không độc lập**: cùng tác giả, cùng mô hình tư duy
+sai. Bỏ `β` khiến PR lớn bị đánh giá thấp một cách hệ thống.
+
+### 3.9 Style lint không vào điểm rủi ro
+
+Loại hẳn: formatting, naming, import order, unused variable, dead code.
+`P(manifest thành sự cố) ≈ 0` và chúng chiếm >90% output linter.
+
+Xem bảng tra tại `docs/fra/SPEC.md` Phụ lục A để biết finding nào được vào
+`P(I)` và với trọng số nào.
+
+### 3.10 Entity ref không dùng line range
+
+```
+✅ src/services/Checkout.py                      (L1)
+✅ src/services/Checkout.py#func:Checkout.charge (L2)
+❌ src/services/Checkout.py#L120-L145            (L3 — vỡ sau mỗi lần format)
+```
+
+### 3.11 `dependency_bump` và `schema_migration` không chạy qua chuỗi PIE
+
+Chúng có chế độ hỏng khác hẳn (transitive CVE, lock contention, backward
+incompatibility trong rolling deploy). Cần checklist riêng. Nhét vào một mô
+hình sẽ cho ra số vô nghĩa.
+
+### 3.12 Phải có nút ghi đè, và phải ghi log
+
+Dev bị chặn mà không có đường ra sẽ tìm cách lách hoặc bỏ dùng hệ thống.
+Tỷ lệ ghi đè là chỉ số sức khỏe quan trọng nhất: **nếu > 0.30, sửa mô hình,
+đừng sửa dev**.
+
+---
+
+## 4. Quy ước code
+
+### Cấu trúc module
+
+```
+fra/
+├── cli.py              # entry point, subcommand
+├── config.py
+├── manifest/           # load, validate, doctor
+├── symbols/            # tree-sitter, ctags fallback, index cache
+├── diff/               # parser, change_kind classifier
+├── impact/             # cochange | imports | coverage | callgraph | closure
+├── adapters/           # base ABC + operational | coverage | mutation | incidents
+├── tree/               # fault tree loader, cutsets, armed, bayes
+├── scoring/            # pie, aggregate, bands
+├── llm/                # client, prompts/ (versioned!), guards
+├── calibration/        # szz, features, train, evaluate
+└── report/             # json, comment, decision
+```
+
+### Nguyên tắc
+
+- **Adapter pattern cho mọi nguồn dữ liệu ngoài.** Thiếu adapter → giảm độ chi
+  tiết output, không sập. Mọi adapter kế thừa ABC trong `adapters/base.py` và
+  trả `None` (không phải `0`) khi không có dữ liệu.
+- **Language-agnostic.** Chỉ được phụ thuộc: `git`, tree-sitter, và format
+  coverage chuẩn (lcov/cobertura/clover/jacoco/gocover/coveragepy). Không hard-code
+  logic cho một ngôn ngữ cụ thể ngoài file query của tree-sitter.
+- **Prompt phải version hóa và commit.** Đổi prompt là đổi mô hình. Ghi
+  `prompt_version` vào output JSON, nếu không sẽ không giải thích được vì sao
+  điểm tuần này khác tuần trước.
+- **Deterministic trước, LLM sau.** Tầng thống kê tính xong mới gọi LLM, và chỉ
+  để diễn giải / kiểm invariant / map nghiệp vụ.
+- **Mọi threshold vào config**, không hard-code. Chúng đều là giả thuyết cần
+  hiệu chỉnh.
+
+### Kiểu dữ liệu
+
+- Entity ref: `str` theo thang L0–L2 (§3.10)
+- Xác suất: `float` trong `[0,1]`, hoặc `None` khi không biết
+- Không dùng `-1`, `0`, hay sentinel khác cho "không biết"
+
+### Test
+
+- Mỗi tầng impact (`cochange`, `imports`, `coverage`) cần fixture repo riêng
+- `cutsets.py` cần test với cây có OR lồng AND lồng OR
+- `guards.py` cần test reject được: `"3.7%"`, `"score: 8/10"`, `"khoảng 0.4"`
+- Test cho `canary_check` với `epd=None`, `epd=0`, `epd` rất nhỏ, `epd` rất lớn
+
+---
+
+## 5. Định nghĩa hoàn thành cho từng phase
+
+Không chuyển sang phase sau khi phase trước chưa đạt hết tiêu chí.
+
+### Phase 1 — Impact mapping
+
+- [ ] `fra doctor` fail CI khi có entity ref không resolve
+- [ ] `fra analyze` in ra flow bị chạm, phân biệt `direct` và `cochange`
+- [ ] Co-change loại được commit >25 file
+- [ ] Canary blindness được tính và in ra kèm thời lượng cần thiết
+- [ ] `fra traffic` parse được ít nhất 2 format log, cảnh báo khi tỷ lệ khớp <50%
+- [ ] Manifest cho **≥3 flow critical**, mỗi flow có ≥1 invariant `confirmed`
+- [ ] **`fra backtest --last 30` đã chạy và đối chiếu bằng tay** với các sự cố
+      đã biết trong lịch sử
+
+Tiêu chí cuối là cửa chặn thật. Nếu FRA không gắn cờ được những thay đổi đã
+thực sự gây sự cố, **không bật lên** — sửa manifest trước.
+
+### Phase 2 — Detection & invariant
+
+- [ ] tree-sitter cho ngôn ngữ chính, symbol index có cache invalidate theo git sha
+- [ ] Change unit ở mức L2 (symbol), hunk mồ côi được xử lý như module
+- [ ] `change_kind` classifier với ≥8 loại, test cho từng loại
+- [ ] Diff coverage từ ≥2 format coverage
+- [ ] LLM invariant check, chỉ đọc invariant `confirmed`
+- [ ] `guards.py` reject được output chứa số
+- [ ] Trường `challenge` trong prompt được parse và in ra khi LLM phản biện
+      việc map diff vào flow
+
+### Phase 3 — Fault tree
+
+- [ ] Fault tree cho ≥3 flow critical, mỗi basic event có `entities` resolve được
+- [ ] `cutsets.py` tính đúng minimal cut set (test với cây lồng nhiều tầng)
+- [ ] Armed cut set detection, gate `hard_block`
+- [ ] Bảng deploy strategy trong `report/decision.py`
+
+### Phase 4 — Calibration
+
+- [ ] SZZ với đủ 4 bộ lọc (>20 file / comment-whitespace / >18 tháng / format-only)
+- [ ] Nhãn từ incident được gán trọng số mẫu cao hơn nhãn từ SZZ
+- [ ] Logistic regression + `CalibratedClassifierCV(method="isotonic")`
+- [ ] Brier score, reliability diagram, precision@10, override rate — báo cáo tuần
+- [ ] Ngưỡng dải đặt ở **phân vị** của phân bố 3 tháng, không phải số tuyệt đối
+- [ ] Chuyển sang `calibrated` mode chỉ khi ≥200 nhãn
+
+---
+
+## 6. Cách làm việc trong repo này
+
+### Khi nhận một task
+
+1. Đọc task trong `docs/fra/IMPLEMENTATION.md` — mỗi task có acceptance criteria
+2. Kiểm §3 xem task có chạm luật cứng nào
+3. Viết test trước cho phần logic tính toán (scoring, cutsets, canary)
+4. Cập nhật khối trạng thái ở §2 khi xong
+5. Nếu quyết định lệch khỏi spec, ghi vào `docs/fra/DECISIONS.md` kèm lý do
+
+### Khi không chắc
+
+Ưu tiên theo thứ tự:
+
+1. **Luật cứng ở §3** thắng mọi thứ
+2. `docs/fra/SPEC.md` — nguồn sự thật về lý thuyết và công thức
+3. Hỏi người — đặc biệt với: gán severity, confirm invariant, đặt ngưỡng gate
+
+Ba việc cuối là **quyết định kinh doanh**, không suy ra được từ code. Không tự
+quyết.
+
+### Điều tuyệt đối không tự làm
+
+- Confirm một invariant `llm_proposed`
+- Gán `severity.class` cho flow
+- Đặt hoặc thay đổi ngưỡng gate
+- Bật `calibrated` mode
+- Xóa hoặc sửa nhãn trong `.fra/calibration/labels.jsonl`
+
+---
+
+## 7. Giới hạn cần thừa nhận
+
+Ghi ở đây để không ai — kể cả agent — cố "sửa" chúng bằng model phức tạp hơn.
+
+**Mô hình không thấy được invariant chưa ai viết ra.** Đây là giới hạn thông
+tin, không phải giới hạn kỹ thuật. Cách duy nhất để cải thiện là viết thêm
+invariant, thường sau khi trả giá bằng một sự cố. Mỗi postmortem phải sinh ra
+tối thiểu một invariant.
+
+**Dự đoán ở mức từng dòng không khả thi.** Precision quá thấp, nhiễu nhiều hơn
+tín hiệu. Đơn vị nhỏ nhất là symbol.
+
+**Goodhart's law sẽ đến.** Khi dev biết có điểm, họ sẽ tối ưu điểm — biểu hiện
+cụ thể là tách PR thành nhiều PR nhỏ để giảm điểm, kể cả khi tách làm *tăng*
+tổng rủi ro vì mất tính nguyên tử. Không đưa risk score vào đánh giá hiệu suất
+cá nhân.
+
+**Ba phần tư giá trị nằm ở deploy strategy, không ở con số.** Độ chính xác dự
+đoán vốn có hạn. Giá trị thật là định tuyến: flow nào cần feature flag, flow
+nào canary sẽ mù, PR nào phải tách. Nếu phải chọn giữa "số chính xác hơn" và
+"định tuyến tốt hơn", chọn cái sau.

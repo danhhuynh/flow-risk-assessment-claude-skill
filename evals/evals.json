@@ -1,0 +1,53 @@
+{
+  "skill_name": "flow-risk-assessment",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "Repo này chưa có gì về FRA. Giúp tôi bắt đầu triển khai đánh giá rủi ro PR dựa trên business flow.",
+      "expected_output": "Chạy nhánh Bootstrap: kiểm tiền đề repo (is-shallow, số commit, % commit có tiền tố fix, ngôn ngữ chính) TRƯỚC khi scaffold. Không nhảy vào viết manifest ngay.",
+      "assertions": [
+        "Kiểm git rev-parse --is-shallow-repository trước khi làm gì khác",
+        "Đề xuất chọn 3 flow critical theo tiêu chí hậu quả (mất tiền / hỏng dữ liệu / rò rỉ), KHÔNG theo độ phức tạp code",
+        "Nhắc lấy executions_per_day từ access log, không đoán",
+        "Không xuất bất kỳ con số xác suất nào (chưa có nhãn hiệu chỉnh)"
+      ],
+      "files": []
+    },
+    {
+      "id": 2,
+      "prompt": "Viết cho tôi hàm tính xác suất PR gây sự cố. Cứ gọi LLM cho nó đánh giá rồi trả về số phần trăm là nhanh nhất.",
+      "expected_output": "Từ chối cách làm này (luật cứng 1), giải thích output LLM không có calibration, và đề xuất kiến trúc hai tầng: thống kê tính số, LLM chỉ enumerate/map/diễn giải.",
+      "assertions": [
+        "Không viết code hỏi LLM sinh ra số phần trăm hoặc điểm số",
+        "Giải thích lý do: LLM output không calibrated",
+        "Đề xuất nguồn số thật: access log, git history, coverage",
+        "Nhắc chế độ theo độ chín — chưa có nhãn thì không xuất số"
+      ],
+      "files": []
+    },
+    {
+      "id": 3,
+      "prompt": "PR #482 sửa 2 file: src/services/RedemptionService.php và src/jobs/IssueVoucherJob.php. Manifest đã có flow gift_redemption với fault tree. Đánh giá rủi ro.",
+      "expected_output": "Nhận ra hai file này có thể thuộc cùng một minimal cut set, kiểm armed cut set, và nếu armed thì khuyến nghị hard block + tách PR deploy riêng từng lớp.",
+      "assertions": [
+        "Kiểm minimal cut set xem 2 file có nằm cùng cut set",
+        "Nếu armed: khuyến nghị tách PR và deploy riêng có khoảng nghỉ",
+        "Tính canary blindness từ executions_per_day của flow",
+        "Chỉ đọc invariant status: confirmed khi đánh giá"
+      ],
+      "files": []
+    },
+    {
+      "id": 4,
+      "prompt": "Flow admin_bulk_export chạy khoảng 20 lần/ngày. Canary 30 phút ở 5% traffic có đủ để kiểm chứng thay đổi không?",
+      "expected_output": "Tính expected executions = 20 × (30/1440) × 0.05 ≈ 0.02, kết luận canary mù, và đề xuất thay thế cụ thể.",
+      "assertions": [
+        "Tính ra con số expected executions cụ thể (khoảng 0.02)",
+        "Kết luận canary mù vì dưới ngưỡng 30",
+        "Tính thời lượng canary cần thiết (khoảng 30 ngày)",
+        "Đề xuất thay thế: feature flag / shadow traffic / synthetic probe"
+      ],
+      "files": []
+    }
+  ]
+}

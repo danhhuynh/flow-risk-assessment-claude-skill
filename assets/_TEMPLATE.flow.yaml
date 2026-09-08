@@ -1,0 +1,95 @@
+# Template Business Flow Manifest
+# Copy vào .fra/flows/<flow_id>.yaml rồi điền.
+# Hướng dẫn chi tiết: docs/fra/MANIFEST-GUIDE.md
+
+schema_version: 1
+
+# snake_case, ổn định — đây là khóa dùng trong mọi report
+id: TODO_flow_id
+
+# Phép thử: người không đọc code có hiểu tên này không?
+name: "TODO — mô tả bằng ngôn ngữ nghiệp vụ"
+
+owners: ["@TODO"]
+
+# ─────────────────────────────────────────────────────────────────
+# SEVERITY — quyết định kinh doanh. Người điền, không phải AI.
+# ─────────────────────────────────────────────────────────────────
+severity:
+  # critical: mất tiền / hỏng dữ liệu không phục hồi / rò rỉ / vi phạm quy định
+  # high:     chặn nghiệp vụ chính, cần can thiệp tay
+  # medium:   giảm chất lượng, có workaround, tự phục hồi
+  # low:      nội bộ hoặc thẩm mỹ
+  class: TODO
+  rationale: "TODO — vì sao nghiêm trọng ở mức này"
+  impact_types: []   # financial | data_integrity | availability | privacy | compliance | reputation
+
+  # 4 cờ dưới đây phân biệt rủi ro TỐT HƠN cả 'class' ở trên.
+  # Gọi lại đúng request đó 2 lần thì kết quả có giống 1 lần?
+  idempotent: TODO
+  # Có nút undo, hoặc query nào hoàn tác được?
+  reversible: TODO
+  # Nếu sai, ai sửa và bằng cách nào? Script tự động = automatic
+  compensating_action: TODO      # automatic | manual | none
+  # Có gì rời khỏi hệ thống mà không lấy lại được? (email, SMS, API bên thứ 3)
+  external_side_effects: TODO
+
+# ─────────────────────────────────────────────────────────────────
+# OPERATIONAL — LẤY TỪ LOG, ĐỪNG ĐOÁN
+#   fra.py traffic --log <path> --format nginx --days 30
+#   Cron: đọc cron expression. 0 */6 * * * = 4/ngày
+#   Không biết? ĐỂ TRỐNG, không điền 0.
+# ─────────────────────────────────────────────────────────────────
+operational:
+  source: TODO                   # adapter:accesslog | manual | otel | prometheus
+  executions_per_day:            # để trống nếu không biết
+  observability:
+    has_slo: false
+    alertable_metric: ""         # metric nào sẽ báo động nếu flow này hỏng?
+    natural_detection_latency_min:
+
+# ─────────────────────────────────────────────────────────────────
+# STEPS — các bước và invariant của chúng
+# ─────────────────────────────────────────────────────────────────
+steps:
+  - id: TODO_step_id
+    name: "TODO"
+    entities:
+      # L1 (file) là mặc định. Wildcard extension để sống qua refactor.
+      # KHÔNG dùng line range (#L120-L145) — vỡ sau mỗi lần format.
+      - "TODO/path/to/File.*"
+    invariants:
+      # Phép thử: có viết được test fail khi invariant này bị vi phạm không?
+      # Nếu không → phát biểu lại cho cụ thể hơn.
+      - id: TODO_inv_id
+        statement: "TODO — điều gì PHẢI luôn đúng, bất kể input/thời điểm/thứ tự"
+        # incident (tốt nhất, rút từ sự cố thật) | human | llm_proposed
+        provenance: TODO
+        incident_ref: ""
+        # CHỈ 'confirmed' được tính vào điểm rủi ro.
+        # llm_proposed luôn bắt đầu ở 'proposed'.
+        status: TODO             # confirmed | proposed | deprecated
+
+# ─────────────────────────────────────────────────────────────────
+# Với flow có idempotent:false hoặc external_side_effects:true,
+# LUÔN kiểm 4 invariant sau (thêm vào steps ở trên nếu áp dụng):
+#   - Hai request đồng thời tới cùng resource không tạo double-effect
+#   - Retry sau timeout không tạo double-effect
+#   - Partial failure để lại state hợp lệ hoặc được cleanup
+#   - Timeout của external call không làm treo transaction đang mở
+# ─────────────────────────────────────────────────────────────────
+
+dependencies:
+  - kind: TODO                   # database | cache | queue | external_api | filesystem | cron | cdn
+    ref: "TODO"
+    timeout_ms:
+    has_circuit_breaker:
+
+entry_points:
+  - kind: TODO                   # http | queue | cron | cli | event | webhook
+    pattern: "TODO"              # lấy từ output của fra.py traffic
+
+maintenance:
+  last_verified: ""
+  verified_by: ""
+  trace_source: ""

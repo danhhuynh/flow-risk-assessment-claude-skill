@@ -1,0 +1,33 @@
+# .gitlab-ci.yml (phần FRA)
+# Chế độ comment-only. KHÔNG gate cho tới khi backtest (T1.7) đã đạt.
+fra:
+  stage: test
+  image: python:3.12-slim
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+  variables:
+    GIT_DEPTH: 0            # BẮT BUỘC — tương đương fetch-depth: 0
+  cache:
+    key: "fra-cochange-$CI_MERGE_REQUEST_TARGET_BRANCH_NAME"
+    paths: [.fra/cache]
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq git curl
+    - pip install --quiet pyyaml
+  script:
+    - python3 tools/fra.py doctor
+    - |
+      python3 tools/fra.py analyze \
+        --base "$CI_MERGE_REQUEST_DIFF_BASE_SHA" \
+        --head "$CI_COMMIT_SHA" \
+        --json fra-report.json | tee fra-comment.txt
+    - |
+      BODY=$(printf '```\n%s\n```' "$(cat fra-comment.txt)" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')
+      curl -sS --request POST \
+        --header "PRIVATE-TOKEN: $FRA_BOT_TOKEN" \
+        --header "Content-Type: application/json" \
+        --data "{\"body\": $BODY}" \
+        "$CI_API_V4_URL/projects/$CI_PROJECT_ID/merge_requests/$CI_MERGE_REQUEST_IID/notes"
+  artifacts:
+    paths: [fra-report.json]
+    expire_in: 30 days
+  allow_failure: true       # comment-only: không chặn MR
