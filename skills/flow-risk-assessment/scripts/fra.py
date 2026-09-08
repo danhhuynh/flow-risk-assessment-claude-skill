@@ -16,6 +16,8 @@ Usage:
   fra.py backtest --last 20              # chạy trên N PR/commit gần nhất
 """
 
+from __future__ import annotations
+
 import argparse
 import fnmatch
 import json
@@ -26,6 +28,12 @@ import sys
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
+
+if sys.version_info < (3, 8):
+    sys.exit(
+        f"Cần Python ≥3.8, đang chạy {sys.version_info.major}.{sys.version_info.minor}.\n"
+        "  macOS: brew install python@3.12  (rồi dùng python3.12 tools/fra.py)"
+    )
 
 try:
     import yaml
