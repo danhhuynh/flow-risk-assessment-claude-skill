@@ -706,21 +706,73 @@ def print_report(rep: dict):
 def backtest(n: int, cfg):
     """Chạy trên N merge commit gần nhất. Bước kiểm chứng rẻ nhất và
     hay bị bỏ: FRA có gắn cờ đúng những thay đổi đã gây sự cố không?"""
-    shas = git("log", "--merges", "-n", str(n),
-               "--pretty=format:%H|%s").splitlines()
-    if not shas:
-        shas = git("log", "-n", str(n), "--pretty=format:%H|%s").splitlines()
+    # Lấy nhiều hơn n vì sẽ lọc bỏ back-merge
+    raw = git("log", "--merges", "-n", str(n * 2),
+              "--pretty=format:%H|%s").splitlines()
+    if not raw:
+        raw = git("log", "-n", str(n), "--pretty=format:%H|%s").splitlines()
 
-    for entry in shas:
-        sha, subject = entry.split("|", 1)
+    # Back-merge (kéo base vào feature branch): sha^ là đầu feature branch,
+    # nên diff sha^..sha = mọi thứ base có mà branch chưa có -> chạm mọi flow.
+    # Không phản ánh thay đổi của PR nào. Phải loại.
+    BACKMERGE = re.compile(
+        r"^Merge (branch|remote-tracking branch) .+ into (?!master\b|main\b)",
+        re.I,
+    )
+
+    entries, skipped = [], 0
+    for e in raw:
+        if "|" not in e:
+            continue
+        sha, subject = e.split("|", 1)
+        if BACKMERGE.match(subject):
+            skipped += 1
+            continue
+        entries.append((sha, subject))
+        if len(entries) >= n:
+            break
+
+    flagged = 0
+    flow_hits = Counter()
+
+    for sha, subject in entries:
         try:
             rep = analyze(f"{sha}^", sha, cfg, use_cochange=False)
         except SystemExit:
             continue
         flows = rep["flows_affected"]
+        if flows:
+            flagged += 1
+        for f in flows:
+            flow_hits[f["flow_id"]] += 1
         tag = ", ".join(f"{f['flow_id']}({f['severity_class']})"
                         for f in flows) or "—"
-        print(f"{sha[:8]}  {len(flows)} flow  {tag:<48}  {subject[:50]}")
+        print(f"{sha[:8]}  {len(flows)} flow  {tag[:60]:<60}  {subject[:44]}")
+
+    total = len(entries)
+    if not total:
+        return
+
+    print()
+    if skipped:
+        print(f"Đã bỏ {skipped} back-merge (diff không phản ánh thay đổi của PR).")
+    rate = flagged / total
+    print(f"Gắn cờ {flagged}/{total} commit ({rate:.0%}).")
+
+    # Dưới 10 commit thì tỷ lệ chưa nói lên gì — không cảnh báo để tránh báo động giả
+    enough = total >= 10
+    if not enough:
+        print(f"  (mẫu {total} commit là quá nhỏ để đánh giá tỷ lệ — "
+              f"chạy --last 30 trở lên)")
+    elif rate > 0.5:
+        print("  ⚠ >50% — closure có thể quá rộng. Tăng cochange.min_confidence,")
+        print("    hoặc thu hẹp entities dùng glob quá lớn.")
+
+    print("\nTần suất mỗi flow bị gắn cờ:")
+    for fid, cnt in flow_hits.most_common():
+        share = cnt / total
+        warn = "  ⚠ entities có thể quá rộng" if (enough and share > 0.4) else ""
+        print(f"  {cnt:>3}/{total} ({share:>4.0%})  {fid}{warn}")
 
 
 # ──────────────────────────── main ────────────────────────────────
