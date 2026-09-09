@@ -360,6 +360,73 @@ def analyze(base: str, head: str, cfg, use_cochange=True) -> dict:
 
 # ─────────────────────────── doctor ───────────────────────────────
 
+# Field hợp lệ của một invariant. Viết sai tên field (ví dụ 'source' thay vì
+# 'provenance' + 'incident_ref') khiến invariant KHÔNG được tính mà không báo lỗi.
+INVARIANT_KEYS = {"id", "statement", "provenance", "incident_ref", "status", "note"}
+INVARIANT_REQUIRED = {"id", "statement", "provenance", "status"}
+PROVENANCE_VALUES = {"incident", "human", "llm_proposed"}
+STATUS_VALUES = {"confirmed", "proposed", "deprecated"}
+
+
+def check_invariant(iv, label: str, step_id: str) -> tuple[int, int]:
+    """Trả về (errors, warnings). Bắt lỗi viết sai schema."""
+    e = w = 0
+    if not isinstance(iv, dict):
+        print(f"  ✗ {label}/{step_id}: invariant không phải mapping: {iv!r}")
+        return 1, 0
+
+    unknown = set(iv) - INVARIANT_KEYS
+    if unknown:
+        hint = ""
+        if "source" in unknown:
+            hint = " → dùng 'provenance' + 'incident_ref' thay cho 'source'"
+        elif "desc" in unknown or "description" in unknown:
+            hint = " → dùng 'statement'"
+        print(f"  ✗ {label}/{step_id}: invariant '{iv.get('id','?')}' có field "
+              f"không hợp lệ: {sorted(unknown)}{hint}")
+        e += 1
+
+    missing = INVARIANT_REQUIRED - set(iv)
+    if missing:
+        print(f"  ✗ {label}/{step_id}: invariant '{iv.get('id','?')}' thiếu "
+              f"field bắt buộc: {sorted(missing)} — sẽ KHÔNG được tính vào điểm")
+        e += 1
+
+    p = iv.get("provenance")
+    if p is not None and p not in PROVENANCE_VALUES:
+        print(f"  ✗ {label}/{step_id}: provenance '{p}' không hợp lệ "
+              f"(phải là {sorted(PROVENANCE_VALUES)})")
+        e += 1
+
+    st = iv.get("status")
+    if st is not None and st not in STATUS_VALUES:
+        print(f"  ✗ {label}/{step_id}: status '{st}' không hợp lệ "
+              f"(phải là {sorted(STATUS_VALUES)})")
+        e += 1
+
+    if p == "incident" and not iv.get("incident_ref"):
+        print(f"  ⚠ {label}/{step_id}: provenance=incident nhưng thiếu "
+              f"incident_ref (mất truy vết về sự cố gốc)")
+        w += 1
+
+    return e, w
+
+
+def check_glob_breadth(pattern: str, tracked: set, label: str,
+                       step_id: str) -> int:
+    """Glob quá rộng khiến mọi PR chạm mọi flow. Trả về số cảnh báo."""
+    p = pattern.split("#", 1)[0].replace("**", "*")
+    n = sum(1 for f in tracked if fnmatch.fnmatch(f, p))
+    total = max(len(tracked), 1)
+    share = n / total
+    if n > 150 or share > 0.10:
+        print(f"  ⚠ {label}/{step_id}: entity '{pattern}' khớp {n} file "
+              f"({share:.0%} repo) — glob quá rộng, mọi PR sẽ chạm flow này. "
+              f"Thu hẹp về thư mục hoặc file cụ thể")
+        return 1
+    return 0
+
+
 def doctor(cfg) -> int:
     flows = load_flows()
     tracked = set(git("ls-files").splitlines())
@@ -398,10 +465,17 @@ def doctor(cfg) -> int:
 
         # Drift: entity ref không resolve được = lỗi thật, không phải cảnh báo
         for step in flow.get("steps", []):
+            sid = step.get("id", "?")
             for ent in step.get("entities", []):
                 if not any(entity_matches(ent, f) for f in tracked):
-                    print(f"  ✗ {label}/{step.get('id')}: entity không resolve: {ent}")
+                    print(f"  ✗ {label}/{sid}: entity không resolve: {ent}")
                     errors += 1
+                else:
+                    warnings += check_glob_breadth(ent, tracked, label, sid)
+            for iv in step.get("invariants", []) or []:
+                e, w = check_invariant(iv, label, sid)
+                errors += e
+                warnings += w
 
         op = flow.get("operational", {}) or {}
         if op.get("executions_per_day") is None:
@@ -586,6 +660,137 @@ def cloudwatch_traffic(group: str, days: int) -> dict:
         "records_matched": matched,
         "endpoints": {ep: round(n / days, 2) for ep, n in counts.most_common(300)},
     }
+
+
+# ─────────────────── hotfix mapping & validation ──────────────────
+
+HOTFIX_GREP = r"hotfix\|revert\|urgent\|rollback\|^fix\|INC-\|critical"
+
+# Loại các "fix" không phải sửa lỗi production
+NOISE = re.compile(
+    r"\b(phpstan|eslint|lint|typo|phpdoc|comment|format|prettier|"
+    r"ci|cd|pipeline|test|spec|docs?|readme|changelog|"
+    r"review comment|address review)\b", re.I,
+)
+
+
+def find_hotfixes(until: str = "", since: str = "", limit: int = 40) -> list:
+    args = ["log", "--grep", HOTFIX_GREP, "-i", "--no-merges",
+            "--pretty=format:%H|%ad|%s", "--date=short"]
+    if until:
+        args.append(f"--until={until}")
+    if since:
+        args.append(f"--since={since}")
+    out = git(*args)
+
+    rows = []
+    for line in out.splitlines():
+        parts = line.split("|", 2)
+        if len(parts) != 3:
+            continue
+        sha, date, subj = parts
+        if NOISE.search(subj):
+            continue
+        rows.append((sha, date, subj))
+        if len(rows) >= limit:
+            break
+    return rows
+
+
+def hotfix_map(cfg, until: str = "", since: str = "", limit: int = 40,
+               label: str = "") -> dict:
+    """Với mỗi hotfix: chạy analyze trên chính commit đó, xem flow nào bắt được.
+
+    Đây là kiểm chứng có ý nghĩa nhất: hotfix là bằng chứng một sự cố ĐÃ xảy ra.
+    """
+    rows = find_hotfixes(until, since, limit)
+    if not rows:
+        print(f"Không tìm thấy hotfix nào trong cửa sổ {label or 'này'}.")
+        return {"total": 0, "caught": 0, "misses": [], "by_flow": Counter()}
+
+    print(f"\n{'commit':<10}{'ngày':<12}{'flow bắt được':<44}subject")
+    print("─" * 108)
+
+    caught, misses = 0, []
+    by_flow = Counter()
+
+    for sha, date, subj in rows:
+        try:
+            rep = analyze(f"{sha}^", sha, cfg, use_cochange=False)
+        except SystemExit:
+            continue
+        ids = [f["flow_id"] for f in rep["flows_affected"]]
+        if ids:
+            caught += 1
+            for i in ids:
+                by_flow[i] += 1
+        else:
+            misses.append((sha, date, subj))
+        tag = ", ".join(ids) if ids else "— KHÔNG BẮT ĐƯỢC"
+        print(f"{sha[:8]:<10}{date:<12}{tag[:42]:<44}{subj[:44]}")
+
+    total = len(rows)
+    print(f"\nRecall: {caught}/{total} ({caught/total:.0%}) hotfix được gắn cờ")
+    if by_flow:
+        print("\nFlow nào bắt được nhiều nhất:")
+        for fid, n in by_flow.most_common():
+            print(f"  {n:>3}  {fid}")
+    if misses:
+        print(f"\n{len(misses)} hotfix KHÔNG bắt được — vùng tối của manifest:")
+        for sha, date, subj in misses[:12]:
+            print(f"  {sha[:8]}  {date}  {subj[:70]}")
+        print("\n  → Xem các commit này chạm file nào, rồi bổ sung vào entities:")
+        print(f"     git show --stat --format='' {misses[0][0][:8]}")
+
+    return {"total": total, "caught": caught, "misses": misses,
+            "by_flow": by_flow}
+
+
+def validate(cfg, split_date: str) -> int:
+    """Kiểm chứng hai cửa sổ: gần đây (có thể đã ảnh hưởng tới manifest) và
+    holdout (cũ hơn split_date, chưa ai xem khi xây manifest).
+
+    Chỉ recall trên holdout mới là bằng chứng thật. Recall trên cửa sổ gần đây
+    bị nhiễu vì manifest thường được điều chỉnh theo đúng các hotfix đó.
+    """
+    print("═" * 108)
+    print(f"CỬA SỔ GẦN ĐÂY (từ {split_date}) — có thể đã ảnh hưởng tới manifest")
+    print("═" * 108)
+    recent = hotfix_map(cfg, since=split_date, label="gần đây")
+
+    print()
+    print("═" * 108)
+    print(f"HOLDOUT (trước {split_date}) — KIỂM CHỨNG ĐỘC LẬP")
+    print("═" * 108)
+    hold = hotfix_map(cfg, until=split_date, label="holdout")
+
+    print()
+    print("═" * 108)
+    print("KẾT LUẬN")
+    print("═" * 108)
+    for name, r in (("gần đây", recent), ("holdout", hold)):
+        if r["total"]:
+            print(f"  {name:<10} recall {r['caught']}/{r['total']} "
+                  f"({r['caught']/r['total']:.0%})")
+        else:
+            print(f"  {name:<10} không có dữ liệu")
+
+    if not hold["total"]:
+        print("\n  ⚠ Không có holdout. Recall ở trên KHÔNG phải kiểm chứng độc lập:")
+        print("    manifest thường được điều chỉnh theo chính các hotfix đã xem.")
+        print("    Thử --split-date sớm hơn để tách được tập holdout.")
+        return 0
+
+    hr = hold["caught"] / hold["total"]
+    print()
+    if hr >= 0.6:
+        print(f"  ✓ Holdout recall {hr:.0%} ≥ 60% — ĐẠT. Được phép bật CI comment-only.")
+        return 0
+    print(f"  ✗ Holdout recall {hr:.0%} < 60% — CHƯA ĐẠT.")
+    print("    Manifest chưa phủ đủ. Xem danh sách 'KHÔNG bắt được' ở trên,")
+    print("    bổ sung entities hoặc thêm flow, rồi chạy lại.")
+    print("    Đừng bật CI khi chưa đạt — team sẽ tin một hệ thống chưa kiểm chứng.")
+    return 1
 
 
 # ──────────────────────────── init ────────────────────────────────
@@ -800,6 +1005,15 @@ def main():
     b = sub.add_parser("backtest")
     b.add_argument("--last", type=int, default=20)
 
+    hm = sub.add_parser("hotfix-map")
+    hm.add_argument("--until", default="", help="chỉ hotfix trước ngày này")
+    hm.add_argument("--since", default="", help="chỉ hotfix sau ngày này")
+    hm.add_argument("--limit", type=int, default=40)
+
+    va = sub.add_parser("validate")
+    va.add_argument("--split-date", required=True,
+                    help="ranh giới holdout, ví dụ 2026-06-01")
+
     sub.add_parser("aws-check")
 
     cw = sub.add_parser("cloudwatch")
@@ -854,6 +1068,12 @@ def main():
         for ep, rate in list(data["endpoints"].items())[:args.top]:
             print(f"{rate:>12,.1f}  {ep}")
         print("\n→ Dùng các số này cho operational.executions_per_day trong manifest.")
+
+    elif args.cmd == "hotfix-map":
+        hotfix_map(cfg, until=args.until, since=args.since, limit=args.limit)
+
+    elif args.cmd == "validate":
+        sys.exit(validate(cfg, args.split_date))
 
     elif args.cmd == "backtest":
         backtest(args.last, cfg)
